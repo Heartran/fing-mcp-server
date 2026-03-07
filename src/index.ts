@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import express, { Request, Response } from "express";
 import { z } from "zod";
 
@@ -9,7 +10,6 @@ import { z } from "zod";
 const FING_API_KEY = process.env.FING_API_KEY ?? "";
 const FING_BASE_URL = process.env.FING_BASE_URL ?? "http://localhost:49090/1";
 const PORT = parseInt(process.env.PORT ?? "3010", 10);
-const LOG_LEVEL = process.env.LOG_LEVEL ?? "info"; // "debug", "info", "warn", "error"
 
 if (!FING_API_KEY) {
   console.error("ERROR: FING_API_KEY environment variable is required");
@@ -57,30 +57,10 @@ interface FingPeopleResponse {
   people: FingPerson[];
 }
 
-// ─── Logging Helper ───────────────────────────────────────────────────────────
-
-function log(level: "debug" | "info" | "warn" | "error", message: string, data?: unknown) {
-  const timestamp = new Date().toISOString();
-  const levels = { debug: 0, info: 1, warn: 2, error: 3 };
-  const currentLevel = levels[LOG_LEVEL as keyof typeof levels] ?? 1;
-  const messageLevel = levels[level];
-  
-  if (messageLevel >= currentLevel) {
-    const logMessage = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
-    if (data) {
-      console.error(logMessage, data);
-    } else {
-      console.error(logMessage);
-    }
-  }
-}
-
 // ─── Fing API Client ──────────────────────────────────────────────────────────
 
 async function fingGet<T>(endpoint: string): Promise<T> {
   const url = `${FING_BASE_URL}/${endpoint}`;
-  log("debug", `Making Fing API request`, { endpoint, url });
-  
   const response = await fetch(url, {
     headers: {
       "Authorization": `Bearer ${FING_API_KEY}`,
@@ -88,28 +68,17 @@ async function fingGet<T>(endpoint: string): Promise<T> {
     }
   });
 
-  log("debug", `Fing API response`, { 
-    status: response.status, 
-    statusText: response.statusText,
-    ok: response.ok 
-  });
-
   if (!response.ok) {
     if (response.status === 401) {
-      log("error", "Fing API authentication failed", { status: 401 });
       throw new Error("Unauthorized: invalid Fing API key");
     }
     if (response.status === 503) {
-      log("error", "Fing agent service unavailable", { status: 503 });
       throw new Error("Fing agent service is unavailable. Make sure Fing Desktop or Fing Agent is running.");
     }
-    log("error", "Fing API error", { status: response.status, statusText: response.statusText });
     throw new Error(`Fing API error: ${response.status} ${response.statusText}`);
   }
 
-  const data = await response.json() as Promise<T>;
-  log("debug", `Fing API success`, { endpoint, dataType: typeof data });
-  return data;
+  return response.json() as Promise<T>;
 }
 
 // ─── Formatting Helpers ───────────────────────────────────────────────────────
@@ -130,19 +99,20 @@ function formatPerson(p: FingPerson, index: number): string {
   return `• ${name} [${state}]\n  Last state change: ${changed}`;
 }
 
-// ─── MCP Server ───────────────────────────────────────────────────────────────
+// ─── MCP Server Factory ───────────────────────────────────────────────────────
 
-const server = new McpServer({
-  name: "fing-mcp-server",
-  version: "1.0.0"
-});
+function createMcpServer(): McpServer {
+  const server = new McpServer({
+    name: "fing-mcp-server",
+    version: "1.0.0"
+  });
 
-// Tool: fing_get_devices
-server.registerTool(
-  "fing_get_devices",
-  {
-    title: "Get Network Devices",
-    description: `Retrieve all devices detected on the local network by the Fing monitoring agent.
+  // Tool: fing_get_devices
+  server.registerTool(
+    "fing_get_devices",
+    {
+      title: "Get Network Devices",
+      description: `Retrieve all devices detected on the local network by the Fing monitoring agent.
 
 Returns device details including MAC address, IP address(es), connection state (UP/DOWN),
 device name, type, manufacturer, model, and connection history timestamps.
@@ -169,72 +139,59 @@ Examples:
 Error handling:
   - Returns error if Fing API key is invalid (401)
   - Returns error if Fing Desktop/Agent is not running (503)`,
-    inputSchema: z.object({
-      filter_state: z.enum(["UP", "DOWN", "ALL"]).default("ALL")
-        .describe("Filter devices by connection state: UP (online), DOWN (offline), ALL"),
-      response_format: z.enum(["text", "json"]).default("text")
-        .describe("Output format: 'text' for human-readable, 'json' for structured data")
-    }).strict(),
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false
+      inputSchema: z.object({
+        filter_state: z.enum(["UP", "DOWN", "ALL"]).default("ALL")
+          .describe("Filter devices by connection state: UP (online), DOWN (offline), ALL"),
+        response_format: z.enum(["text", "json"]).default("text")
+          .describe("Output format: 'text' for human-readable, 'json' for structured data")
+      }).strict(),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false
+      }
+    },
+    async ({ filter_state, response_format }) => {
+      let data: FingDevicesResponse;
+      try {
+        data = await fingGet<FingDevicesResponse>("devices");
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text", text: `Error fetching devices: ${message}` }] };
+      }
+
+      const devices = filter_state === "ALL"
+        ? data.devices
+        : data.devices.filter(d => d.state === filter_state);
+
+      if (response_format === "json") {
+        const output = { networkId: data.networkId, count: devices.length, devices };
+        return {
+          content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
+          structuredContent: output
+        };
+      }
+
+      const upCount = devices.filter(d => d.state === "UP").length;
+      const downCount = devices.filter(d => d.state === "DOWN").length;
+      const lines = [
+        `Network: ${data.networkId}`,
+        `Devices shown: ${devices.length} (🟢 ${upCount} UP, 🔴 ${downCount} DOWN)`,
+        "",
+        ...devices.map(formatDevice)
+      ];
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
     }
-  },
-  async ({ filter_state, response_format }) => {
-    log("info", `fing_get_devices called`, { filter_state, response_format });
-    
-    let data: FingDevicesResponse;
-    try {
-      data = await fingGet<FingDevicesResponse>("devices");
-      log("info", `Devices fetched successfully`, { 
-        totalDevices: data.devices.length, 
-        networkId: data.networkId 
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      log("error", `Error fetching devices`, { error: message });
-      return { content: [{ type: "text", text: `Error fetching devices: ${message}` }] };
-    }
+  );
 
-    const devices = filter_state === "ALL"
-      ? data.devices
-      : data.devices.filter(d => d.state === filter_state);
-
-    log("debug", `Devices filtered`, { 
-      beforeFilter: data.devices.length, 
-      afterFilter: devices.length, 
-      filterState: filter_state 
-    });
-
-    if (response_format === "json") {
-      const output = { networkId: data.networkId, count: devices.length, devices };
-      return {
-        content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
-        structuredContent: output
-      };
-    }
-
-    const upCount = devices.filter(d => d.state === "UP").length;
-    const downCount = devices.filter(d => d.state === "DOWN").length;
-    const lines = [
-      `Network: ${data.networkId}`,
-      `Devices shown: ${devices.length} (🟢 ${upCount} UP, 🔴 ${downCount} DOWN)`,
-      "",
-      ...devices.map(formatDevice)
-    ];
-
-    return { content: [{ type: "text", text: lines.join("\n") }] };
-  }
-);
-
-// Tool: fing_get_people
-server.registerTool(
-  "fing_get_people",
-  {
-    title: "Get Network People / Presence",
-    description: `Retrieve presence information for people associated with network devices in Fing.
+  // Tool: fing_get_people
+  server.registerTool(
+    "fing_get_people",
+    {
+      title: "Get Network People / Presence",
+      description: `Retrieve presence information for people associated with network devices in Fing.
 
 People in Fing represent individuals whose devices are tracked on the network.
 This tool shows who is currently ONLINE or OFFLINE based on device presence detection.
@@ -257,125 +214,121 @@ Note: People must be configured in Fing Desktop/App for this to return useful da
 Error handling:
   - Returns error if Fing API key is invalid (401)
   - Returns error if Fing Desktop/Agent is not running (503)`,
-    inputSchema: z.object({
-      filter_state: z.enum(["ONLINE", "OFFLINE", "ALL"]).default("ALL")
-        .describe("Filter people by presence state: ONLINE, OFFLINE, ALL"),
-      response_format: z.enum(["text", "json"]).default("text")
-        .describe("Output format: 'text' for human-readable, 'json' for structured data")
-    }).strict(),
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false
+      inputSchema: z.object({
+        filter_state: z.enum(["ONLINE", "OFFLINE", "ALL"]).default("ALL")
+          .describe("Filter people by presence state: ONLINE, OFFLINE, ALL"),
+        response_format: z.enum(["text", "json"]).default("text")
+          .describe("Output format: 'text' for human-readable, 'json' for structured data")
+      }).strict(),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false
+      }
+    },
+    async ({ filter_state, response_format }) => {
+      let data: FingPeopleResponse;
+      try {
+        data = await fingGet<FingPeopleResponse>("people");
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text", text: `Error fetching people: ${message}` }] };
+      }
+
+      const people = filter_state === "ALL"
+        ? data.people
+        : data.people.filter(p => p.currentState === filter_state);
+
+      if (response_format === "json") {
+        const output = {
+          networkId: data.networkId,
+          lastChangeTime: data.lastChangeTime,
+          count: people.length,
+          people
+        };
+        return {
+          content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
+          structuredContent: output
+        };
+      }
+
+      if (people.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: filter_state === "ALL"
+              ? "No people configured in Fing. Add people in Fing Desktop/App to track presence."
+              : `No people with state ${filter_state} found.`
+          }]
+        };
+      }
+
+      const onlineCount = people.filter(p => p.currentState === "ONLINE").length;
+      const lastChange = data.lastChangeTime ? new Date(data.lastChangeTime).toLocaleString() : "n/a";
+      const lines = [
+        `Network: ${data.networkId}`,
+        `People shown: ${people.length} (🟢 ${onlineCount} ONLINE, 🔴 ${people.length - onlineCount} OFFLINE)`,
+        `Last network change: ${lastChange}`,
+        "",
+        ...people.map((p, i) => formatPerson(p, i))
+      ];
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
     }
-  },
-  async ({ filter_state, response_format }) => {
-    log("info", `fing_get_people called`, { filter_state, response_format });
-    
-    let data: FingPeopleResponse;
-    try {
-      data = await fingGet<FingPeopleResponse>("people");
-      log("info", `People fetched successfully`, { 
-        totalPeople: data.people.length, 
-        networkId: data.networkId,
-        lastChangeTime: data.lastChangeTime 
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      log("error", `Error fetching people`, { error: message });
-      return { content: [{ type: "text", text: `Error fetching people: ${message}` }] };
-    }
+  );
 
-    const people = filter_state === "ALL"
-      ? data.people
-      : data.people.filter(p => p.currentState === filter_state);
-
-    log("debug", `People filtered`, { 
-      beforeFilter: data.people.length, 
-      afterFilter: people.length, 
-      filterState: filter_state 
-    });
-
-    if (response_format === "json") {
-      const output = {
-        networkId: data.networkId,
-        lastChangeTime: data.lastChangeTime,
-        count: people.length,
-        people
-      };
-      return {
-        content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
-        structuredContent: output
-      };
-    }
-
-    if (people.length === 0) {
-      return {
-        content: [{
-          type: "text",
-          text: filter_state === "ALL"
-            ? "No people configured in Fing. Add people in Fing Desktop/App to track presence."
-            : `No people with state ${filter_state} found.`
-        }]
-      };
-    }
-
-    const onlineCount = people.filter(p => p.currentState === "ONLINE").length;
-    const lastChange = data.lastChangeTime ? new Date(data.lastChangeTime).toLocaleString() : "n/a";
-    const lines = [
-      `Network: ${data.networkId}`,
-      `People shown: ${people.length} (🟢 ${onlineCount} ONLINE, 🔴 ${people.length - onlineCount} OFFLINE)`,
-      `Last network change: ${lastChange}`,
-      "",
-      ...people.map((p, i) => formatPerson(p, i))
-    ];
-
-    return { content: [{ type: "text", text: lines.join("\n") }] };
-  }
-);
+  return server;
+}
 
 // ─── HTTP Server ──────────────────────────────────────────────────────────────
 
 const app = express();
 app.use(express.json());
 
+// SSE transport sessions (for mcp-remote compatibility)
+const sseTransports = new Map<string, SSEServerTransport>();
+
+// SSE: GET /mcp — opens the SSE stream (used by mcp-remote)
+app.get("/mcp", async (req: Request, res: Response) => {
+  const transport = new SSEServerTransport("/mcp/message", res);
+  sseTransports.set(transport.sessionId, transport);
+  res.on("close", () => sseTransports.delete(transport.sessionId));
+  const server = createMcpServer();
+  await server.connect(transport);
+});
+
+// SSE: POST /mcp/message — receives messages from mcp-remote
+app.post("/mcp/message", async (req: Request, res: Response) => {
+  const sessionId = req.query.sessionId as string;
+  const transport = sseTransports.get(sessionId);
+  if (!transport) {
+    res.status(404).json({ error: "Session not found" });
+    return;
+  }
+  await transport.handlePostMessage(req, res, req.body);
+});
+
+// Streamable HTTP: POST /mcp — native Claude Desktop "type: http" support
 app.post("/mcp", async (req: Request, res: Response) => {
-  log("info", `MCP request received`, { 
-    method: req.method, 
-    url: req.url,
-    userAgent: req.get("User-Agent"),
-    bodyKeys: Object.keys(req.body || {})
-  });
-  
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true
   });
-  
-  res.on("close", () => {
-    log("debug", `MCP response closed`);
-    transport.close();
-  });
-  
+  res.on("close", () => transport.close());
+  const server = createMcpServer();
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
-  
-  log("debug", `MCP request handled`);
 });
 
+// Health check
 app.get("/health", (_req: Request, res: Response) => {
-  log("debug", `Health check requested`);
   res.json({ status: "ok", service: "fing-mcp-server", version: "1.0.0" });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  log("info", `Fing MCP server started`, { 
-    port: PORT, 
-    host: "0.0.0.0",
-    fingBaseUrl: FING_BASE_URL,
-    logLevel: LOG_LEVEL
-  });
-  console.error(`Fing MCP server running on http://0.0.0.0:${PORT}/mcp`);
-  console.error(`Health check: http://0.0.0.0:${PORT}/health`);
+  console.error(`Fing MCP server running on http://0.0.0.0:${PORT}`);
+  console.error(`  SSE (mcp-remote):        GET  http://0.0.0.0:${PORT}/mcp`);
+  console.error(`  Streamable HTTP (native): POST http://0.0.0.0:${PORT}/mcp`);
+  console.error(`  Health check:             GET  http://0.0.0.0:${PORT}/health`);
 });
