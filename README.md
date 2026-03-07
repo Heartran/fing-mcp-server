@@ -40,6 +40,7 @@ Il server risponde su `http://localhost:3010/mcp`.
 | `FING_API_KEY`  | *(obbligatoria)*           | API key di Fing Local API            |
 | `FING_BASE_URL` | `http://localhost:49090/1` | URL base dell'agente Fing            |
 | `PORT`          | `3010`                     | Porta su cui esporre il server MCP   |
+| `LOG_LEVEL`     | `info`                     | Livello di logging: `debug`, `info`, `warn`, `error` |
 
 Puoi configurarle tramite un file `.env` nella root del progetto (vedi `.env.example`).
 
@@ -48,6 +49,42 @@ Puoi configurarle tramite un file `.env` nella root del progetto (vedi `.env.exa
 ```bash
 # Avvio in modalità sviluppo (senza build)
 npm run dev
+```
+
+## Logging Verboso
+
+Il server supporta logging dettagliato per aiutare il debug e il monitoraggio. Imposta la variabile `LOG_LEVEL` per controllare la verbosità:
+
+```bash
+# Logging dettagliato (tutte le richieste API, risposte, filtri)
+LOG_LEVEL=debug npm start
+
+# Logging standard (solo eventi importanti)
+LOG_LEVEL=info npm start
+
+# Solo warning ed errori
+LOG_LEVEL=warn npm start
+
+# Solo errori critici
+LOG_LEVEL=error npm start
+```
+
+Cosa viene loggato:
+- **debug**: Richieste/risposte HTTP, dettagli API Fing, operazioni di filtraggio
+- **info**: Chiamate ai tool, risultati delle API, avvio server
+- **warn**: Problemi non critici
+- **error**: Errori API, autenticazione fallita, servizi non disponibili
+
+Esempio di output con `LOG_LEVEL=debug`:
+```
+[2026-03-07T15:30:00.123Z] [INFO] Fing MCP server started { port: 3010, host: "0.0.0.0", logLevel: "debug" }
+[2026-03-07T15:30:05.456Z] [INFO] MCP request received { method: "POST", url: "/mcp", userAgent: "mcp-remote/1.0" }
+[2026-03-07T15:30:05.789Z] [INFO] fing_get_devices called { filter_state: "UP", response_format: "text" }
+[2026-03-07T15:30:05.890Z] [DEBUG] Making Fing API request { endpoint: "devices", url: "http://localhost:49090/1/devices" }
+[2026-03-07T15:30:06.123Z] [DEBUG] Fing API response { status: 200, statusText: "OK", ok: true }
+[2026-03-07T15:30:06.234Z] [DEBUG] Fing API success { endpoint: "devices", dataType: "object" }
+[2026-03-07T15:30:06.345Z] [INFO] Devices fetched successfully { totalDevices: 5, networkId: "12345" }
+[2026-03-07T15:30:06.456Z] [DEBUG] Devices filtered { beforeFilter: 5, afterFilter: 3, filterState: "UP" }
 ```
 
 ## Avvio automatico con Windows Task Scheduler
@@ -75,8 +112,14 @@ Nel file `claude_desktop_config.json` aggiungi:
 {
   "mcpServers": {
     "fing": {
-      "type": "http",
-      "url": "http://<IP-DEL-SERVER>:3010/mcp"
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npx",
+        "-y",
+        "mcp-remote",
+        "http://<IP-DEL-SERVER>:3010/mcp"
+      ]
     }
   }
 }

@@ -9,6 +9,7 @@ import { z } from "zod";
 const FING_API_KEY = process.env.FING_API_KEY ?? "";
 const FING_BASE_URL = process.env.FING_BASE_URL ?? "http://localhost:49090/1";
 const PORT = parseInt(process.env.PORT ?? "3010", 10);
+const LOG_LEVEL = process.env.LOG_LEVEL ?? "info"; // "debug", "info", "warn", "error"
 
 if (!FING_API_KEY) {
   console.error("ERROR: FING_API_KEY environment variable is required");
@@ -56,10 +57,30 @@ interface FingPeopleResponse {
   people: FingPerson[];
 }
 
+// ─── Logging Helper ───────────────────────────────────────────────────────────
+
+function log(level: "debug" | "info" | "warn" | "error", message: string, data?: unknown) {
+  const timestamp = new Date().toISOString();
+  const levels = { debug: 0, info: 1, warn: 2, error: 3 };
+  const currentLevel = levels[LOG_LEVEL as keyof typeof levels] ?? 1;
+  const messageLevel = levels[level];
+  
+  if (messageLevel >= currentLevel) {
+    const logMessage = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
+    if (data) {
+      console.error(logMessage, data);
+    } else {
+      console.error(logMessage);
+    }
+  }
+}
+
 // ─── Fing API Client ──────────────────────────────────────────────────────────
 
 async function fingGet<T>(endpoint: string): Promise<T> {
   const url = `${FING_BASE_URL}/${endpoint}`;
+  log("debug", `Making Fing API request`, { endpoint, url });
+  
   const response = await fetch(url, {
     headers: {
       "Authorization": `Bearer ${FING_API_KEY}`,
@@ -67,17 +88,28 @@ async function fingGet<T>(endpoint: string): Promise<T> {
     }
   });
 
+  log("debug", `Fing API response`, { 
+    status: response.status, 
+    statusText: response.statusText,
+    ok: response.ok 
+  });
+
   if (!response.ok) {
     if (response.status === 401) {
+      log("error", "Fing API authentication failed", { status: 401 });
       throw new Error("Unauthorized: invalid Fing API key");
     }
     if (response.status === 503) {
+      log("error", "Fing agent service unavailable", { status: 503 });
       throw new Error("Fing agent service is unavailable. Make sure Fing Desktop or Fing Agent is running.");
     }
+    log("error", "Fing API error", { status: response.status, statusText: response.statusText });
     throw new Error(`Fing API error: ${response.status} ${response.statusText}`);
   }
 
-  return response.json() as Promise<T>;
+  const data = await response.json() as Promise<T>;
+  log("debug", `Fing API success`, { endpoint, dataType: typeof data });
+  return data;
 }
 
 // ─── Formatting Helpers ───────────────────────────────────────────────────────
@@ -151,17 +183,30 @@ Error handling:
     }
   },
   async ({ filter_state, response_format }) => {
+    log("info", `fing_get_devices called`, { filter_state, response_format });
+    
     let data: FingDevicesResponse;
     try {
       data = await fingGet<FingDevicesResponse>("devices");
+      log("info", `Devices fetched successfully`, { 
+        totalDevices: data.devices.length, 
+        networkId: data.networkId 
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      log("error", `Error fetching devices`, { error: message });
       return { content: [{ type: "text", text: `Error fetching devices: ${message}` }] };
     }
 
     const devices = filter_state === "ALL"
       ? data.devices
       : data.devices.filter(d => d.state === filter_state);
+
+    log("debug", `Devices filtered`, { 
+      beforeFilter: data.devices.length, 
+      afterFilter: devices.length, 
+      filterState: filter_state 
+    });
 
     if (response_format === "json") {
       const output = { networkId: data.networkId, count: devices.length, devices };
@@ -226,17 +271,31 @@ Error handling:
     }
   },
   async ({ filter_state, response_format }) => {
+    log("info", `fing_get_people called`, { filter_state, response_format });
+    
     let data: FingPeopleResponse;
     try {
       data = await fingGet<FingPeopleResponse>("people");
+      log("info", `People fetched successfully`, { 
+        totalPeople: data.people.length, 
+        networkId: data.networkId,
+        lastChangeTime: data.lastChangeTime 
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      log("error", `Error fetching people`, { error: message });
       return { content: [{ type: "text", text: `Error fetching people: ${message}` }] };
     }
 
     const people = filter_state === "ALL"
       ? data.people
       : data.people.filter(p => p.currentState === filter_state);
+
+    log("debug", `People filtered`, { 
+      beforeFilter: data.people.length, 
+      afterFilter: people.length, 
+      filterState: filter_state 
+    });
 
     if (response_format === "json") {
       const output = {
@@ -282,20 +341,41 @@ const app = express();
 app.use(express.json());
 
 app.post("/mcp", async (req: Request, res: Response) => {
+  log("info", `MCP request received`, { 
+    method: req.method, 
+    url: req.url,
+    userAgent: req.get("User-Agent"),
+    bodyKeys: Object.keys(req.body || {})
+  });
+  
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true
   });
-  res.on("close", () => transport.close());
+  
+  res.on("close", () => {
+    log("debug", `MCP response closed`);
+    transport.close();
+  });
+  
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
+  
+  log("debug", `MCP request handled`);
 });
 
 app.get("/health", (_req: Request, res: Response) => {
+  log("debug", `Health check requested`);
   res.json({ status: "ok", service: "fing-mcp-server", version: "1.0.0" });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
+  log("info", `Fing MCP server started`, { 
+    port: PORT, 
+    host: "0.0.0.0",
+    fingBaseUrl: FING_BASE_URL,
+    logLevel: LOG_LEVEL
+  });
   console.error(`Fing MCP server running on http://0.0.0.0:${PORT}/mcp`);
   console.error(`Health check: http://0.0.0.0:${PORT}/health`);
 });
