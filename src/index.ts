@@ -295,7 +295,7 @@ app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", service: "fing-mcp-server", version: "1.0.0" });
 });
 
-app.listen(PORT, () => {
-  console.error(`Fing MCP server running on http://localhost:${PORT}/mcp`);
-  console.error(`Health check: http://localhost:${PORT}/health`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.error(`Fing MCP server running on http://0.0.0.0:${PORT}/mcp`);
+  console.error(`Health check: http://0.0.0.0:${PORT}/health`);
 });
