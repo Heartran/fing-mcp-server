@@ -60,10 +60,9 @@ interface FingPeopleResponse {
 // ─── Fing API Client ──────────────────────────────────────────────────────────
 
 async function fingGet<T>(endpoint: string): Promise<T> {
-  const url = `${FING_BASE_URL}/${endpoint}`;
+  const url = `${FING_BASE_URL}/${endpoint}?auth=${FING_API_KEY}`;
   const response = await fetch(url, {
     headers: {
-      "Authorization": `Bearer ${FING_API_KEY}`,
       "Accept": "application/json"
     }
   });
