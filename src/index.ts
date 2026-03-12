@@ -48,7 +48,14 @@ interface FingDevicesResponse {
 }
 
 interface FingPersonPresenceDeviceDetails {
-  [key: string]: unknown;
+  mac: string;
+  ip: string[];
+  state: "UP" | "DOWN" | string;
+  name?: string;
+  type?: string;
+  make?: string;
+  model?: string;
+  last_changed?: string;
 }
 
 interface FingContactInfo {
@@ -63,12 +70,13 @@ interface FingPerson {
   stateChangeTime?: string;
   contactInfo?: FingContactInfo;
   currentState?: "ONLINE" | "OFFLINE" | string;
-  presenceDeviceDetails?: FingPersonPresenceDeviceDetails;
+  presenceDeviceDetails?: FingPersonPresenceDeviceDetails[];
 }
 
 interface FingPeopleResponse {
   networkId: string;
   lastChangeTime?: string;
+  lastUpdateTime?: string;
   people: FingPerson[];
 }
 
@@ -269,11 +277,76 @@ function formatPerson(person: FingPerson, index: number): string {
     person.contactInfo?.name ??
     `Person ${index + 1}`;
   const state = person.currentState === "ONLINE" ? "ONLINE" : "OFFLINE";
+  const devices =
+    person.presenceDeviceDetails?.map((device) => `${device.name ?? device.mac} [${device.state}]`).join(", ");
 
   return [
     `- ${name} [${state}]`,
-    `  Last state change: ${formatTimestamp(person.stateChangeTime)}`
+    `  Last state change: ${formatTimestamp(person.stateChangeTime)}`,
+    ...(devices ? [`  Devices: ${devices}`] : [])
   ].join("\n");
+}
+
+function mostRecentTimestamp(values: Array<string | undefined>): string | undefined {
+  let bestValue: string | undefined;
+  let bestTime = Number.NEGATIVE_INFINITY;
+
+  for (const value of values) {
+    if (!value) {
+      continue;
+    }
+
+    const time = Date.parse(value);
+    if (Number.isNaN(time)) {
+      continue;
+    }
+
+    if (time > bestTime) {
+      bestTime = time;
+      bestValue = value;
+    }
+  }
+
+  return bestValue;
+}
+
+function enrichPeopleWithPresence(people: FingPerson[], devices: FingDevice[]): FingPerson[] {
+  const devicesByContactId = new Map<string, FingPersonPresenceDeviceDetails[]>();
+
+  for (const device of devices) {
+    if (!device.contactId) {
+      continue;
+    }
+
+    const entry = devicesByContactId.get(device.contactId) ?? [];
+    entry.push({
+      mac: device.mac,
+      ip: device.ip ?? [],
+      state: device.state,
+      name: device.name,
+      type: device.type,
+      make: device.make,
+      model: device.model,
+      last_changed: device.last_changed
+    });
+    devicesByContactId.set(device.contactId, entry);
+  }
+
+  return people.map((person) => {
+    const associatedDevices = person.contactInfo?.contactId
+      ? (devicesByContactId.get(person.contactInfo.contactId) ?? [])
+      : [];
+    const hasOnlineDevice = associatedDevices.some((device) => device.state === "UP");
+
+    return {
+      ...person,
+      currentState: person.currentState ?? (hasOnlineDevice ? "ONLINE" : "OFFLINE"),
+      stateChangeTime: person.stateChangeTime ?? mostRecentTimestamp(
+        associatedDevices.map((device) => device.last_changed)
+      ),
+      presenceDeviceDetails: associatedDevices
+    };
+  });
 }
 
 function createMcpServer(): McpServer {
@@ -408,24 +481,33 @@ Error handling:
       }
     },
     async ({ filter_state, response_format }) => {
-      let data: FingPeopleResponse;
+      let peopleData: FingPeopleResponse;
+      let devicesData: FingDevicesResponse;
 
       try {
-        data = await fingGet<FingPeopleResponse>("people");
+        [peopleData, devicesData] = await Promise.all([
+          fingGet<FingPeopleResponse>("people"),
+          fingGet<FingDevicesResponse>("devices")
+        ]);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return { content: [{ type: "text", text: `Error fetching people: ${message}` }] };
       }
 
+      const resolvedLastChangeTime =
+        peopleData.lastChangeTime ??
+        peopleData.lastUpdateTime ??
+        mostRecentTimestamp(devicesData.devices.map((device) => device.last_changed));
+      const resolvedPeople = enrichPeopleWithPresence(peopleData.people, devicesData.devices);
       const people =
         filter_state === "ALL"
-          ? data.people
-          : data.people.filter((person) => person.currentState === filter_state);
+          ? resolvedPeople
+          : resolvedPeople.filter((person) => person.currentState === filter_state);
 
       if (response_format === "json") {
         const output = {
-          networkId: data.networkId,
-          lastChangeTime: data.lastChangeTime,
+          networkId: peopleData.networkId,
+          lastChangeTime: resolvedLastChangeTime,
           count: people.length,
           people
         };
@@ -450,9 +532,9 @@ Error handling:
 
       const onlineCount = people.filter((person) => person.currentState === "ONLINE").length;
       const lines = [
-        `Network: ${data.networkId}`,
+        `Network: ${peopleData.networkId}`,
         `People shown: ${people.length} (${onlineCount} ONLINE, ${people.length - onlineCount} OFFLINE)`,
-        `Last network change: ${formatTimestamp(data.lastChangeTime)}`,
+        `Last network change: ${formatTimestamp(resolvedLastChangeTime)}`,
         "",
         ...people.map(formatPerson)
       ];
