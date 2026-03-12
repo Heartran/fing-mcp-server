@@ -1,22 +1,33 @@
 import "dotenv/config";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import express, { Request, Response } from "express";
+import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import express, { Request, Response } from "express";
-import { z } from "zod";
 
-// ─── Config ───────────────────────────────────────────────────────────────────
+const execFileAsync = promisify(execFile);
 
-const FING_API_KEY = process.env.FING_API_KEY ?? "";
-const FING_BASE_URL = process.env.FING_BASE_URL ?? "http://localhost:49090/1";
-const PORT = parseInt(process.env.PORT ?? "3010", 10);
+const DEFAULT_LOCALAPI_PORT = "49090";
+const DEFAULT_SERVER_PORT = 3010;
+const DEFAULT_BASE_URL = `http://localhost:${DEFAULT_LOCALAPI_PORT}`;
 
-if (!FING_API_KEY) {
-  console.error("ERROR: FING_API_KEY environment variable is required");
-  process.exit(1);
+interface FingLocalApiConfigFile {
+  enabled?: string;
+  port?: string;
+  auth?: string;
 }
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+interface ResolvedFingConfig {
+  authToken: string;
+  baseUrl: string;
+  localApiConfigPath: string;
+  localApiEnabled?: boolean;
+}
 
 interface FingDevice {
   mac: string;
@@ -41,6 +52,10 @@ interface FingPersonPresenceDeviceDetails {
 }
 
 interface FingContactInfo {
+  contactId?: string;
+  displayName?: string;
+  name?: string;
+  contactType?: string;
   [key: string]: unknown;
 }
 
@@ -57,48 +72,209 @@ interface FingPeopleResponse {
   people: FingPerson[];
 }
 
-// ─── Fing API Client ──────────────────────────────────────────────────────────
+function normalizeBaseUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim().replace(/\/+$/, "");
+  return trimmed.endsWith("/1") ? trimmed.slice(0, -2) : trimmed;
+}
 
-async function fingGet<T>(endpoint: string): Promise<T> {
-  const url = `${FING_BASE_URL}/${endpoint}?auth=${FING_API_KEY}`;
+function defaultLocalApiConfigPath(): string {
+  const appData = process.env.APPDATA ?? path.join(os.homedir(), "AppData", "Roaming");
+  return path.join(appData, "FingAgent", "conf", "localapi", "fingagent.json");
+}
+
+function readLocalApiConfig(filePath: string): FingLocalApiConfigFile | undefined {
+  try {
+    const raw = fs.readFileSync(filePath, "utf8");
+    return JSON.parse(raw) as FingLocalApiConfigFile;
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveFingConfig(): ResolvedFingConfig {
+  const localApiConfigPath = process.env.FING_LOCALAPI_CONFIG ?? defaultLocalApiConfigPath();
+  const localApiConfig = readLocalApiConfig(localApiConfigPath);
+  const authToken =
+    process.env.FING_LOCALAPI_AUTH ??
+    process.env.FING_API_KEY ??
+    localApiConfig?.auth ??
+    "";
+  const localApiPort =
+    process.env.FING_LOCALAPI_PORT ??
+    process.env.FING_PORT ??
+    localApiConfig?.port ??
+    DEFAULT_LOCALAPI_PORT;
+  const baseUrl = normalizeBaseUrl(
+    process.env.FING_BASE_URL ?? `http://localhost:${localApiPort}`
+  );
+
+  if (!authToken) {
+    console.error(
+      "ERROR: Fing local API auth token not found. Set FING_LOCALAPI_AUTH/FING_API_KEY " +
+      `or make sure ${localApiConfigPath} exists and contains the localapi auth value.`
+    );
+    process.exit(1);
+  }
+
+  return {
+    authToken,
+    baseUrl,
+    localApiConfigPath,
+    localApiEnabled: localApiConfig?.enabled === "true"
+  };
+}
+
+const FING_CONFIG = resolveFingConfig();
+const FING_API_KEY = FING_CONFIG.authToken;
+const FING_BASE_URL = FING_CONFIG.baseUrl;
+const PORT = parseInt(process.env.PORT ?? String(DEFAULT_SERVER_PORT), 10);
+
+function buildFingUrl(endpoint: string): string {
+  const url = new URL(endpoint, `${FING_BASE_URL}/`);
+  url.searchParams.set("auth", FING_API_KEY);
+  return url.toString();
+}
+
+function parseCurlResponse(stdout: string): { status: number; body: string } {
+  const match = stdout.match(/\r?\n(\d{3})\s*$/);
+  if (!match || match.index === undefined) {
+    throw new Error("Unexpected curl output while talking to Fing local API");
+  }
+
+  return {
+    status: Number(match[1]),
+    body: stdout.slice(0, match.index)
+  };
+}
+
+async function fingGetViaCurl<T>(url: string): Promise<T> {
+  let stdout: string;
+  let stderr: string;
+
+  try {
+    ({ stdout, stderr } = await execFileAsync(
+      "curl.exe",
+      ["-sS", "--max-time", "10", "-o", "-", "-w", "\n%{http_code}", url],
+      {
+        windowsHide: true,
+        maxBuffer: 50 * 1024 * 1024
+      }
+    ));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/ENOENT/i.test(message)) {
+      throw new Error("curl.exe is required on Windows to talk to the Fing local API");
+    }
+
+    throw new Error(`Fing local API request failed: ${message}`);
+  }
+
+  if (stderr.trim()) {
+    const lowered = stderr.toLowerCase();
+    if (
+      lowered.includes("failed to connect") ||
+      lowered.includes("could not connect") ||
+      lowered.includes("timed out")
+    ) {
+      throw new Error(
+        "Fing agent service is unavailable. Make sure Fing Desktop or Fing Agent is running."
+      );
+    }
+  }
+
+  const { status, body } = parseCurlResponse(stdout);
+
+  if (status === 401) {
+    throw new Error("Unauthorized: invalid Fing local API auth token");
+  }
+
+  if (status === 503) {
+    throw new Error(
+      "Fing agent service is unavailable. Make sure Fing Desktop or Fing Agent is running."
+    );
+  }
+
+  if (status < 200 || status >= 300) {
+    throw new Error(`Fing API error: ${status}`);
+  }
+
+  try {
+    return JSON.parse(body) as T;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid JSON returned by Fing local API: ${message}`);
+  }
+}
+
+async function fingGetViaFetch<T>(url: string): Promise<T> {
   const response = await fetch(url, {
     headers: {
-      "Accept": "application/json"
+      Accept: "application/json"
     }
   });
 
   if (!response.ok) {
     if (response.status === 401) {
-      throw new Error("Unauthorized: invalid Fing API key");
+      throw new Error("Unauthorized: invalid Fing local API auth token");
     }
+
     if (response.status === 503) {
-      throw new Error("Fing agent service is unavailable. Make sure Fing Desktop or Fing Agent is running.");
+      throw new Error(
+        "Fing agent service is unavailable. Make sure Fing Desktop or Fing Agent is running."
+      );
     }
+
     throw new Error(`Fing API error: ${response.status} ${response.statusText}`);
   }
 
   return response.json() as Promise<T>;
 }
 
-// ─── Formatting Helpers ───────────────────────────────────────────────────────
+async function fingGet<T>(endpoint: string): Promise<T> {
+  const url = buildFingUrl(endpoint);
 
-function formatDevice(d: FingDevice): string {
-  const ips = d.ip?.join(", ") ?? "unknown";
-  const name = d.name ?? "Unnamed device";
-  const type = [d.make, d.model, d.type].filter(Boolean).join(" ") || "Unknown";
-  const state = d.state === "UP" ? "🟢 UP" : "🔴 DOWN";
-  const lastChanged = d.last_changed ? new Date(d.last_changed).toLocaleString() : "n/a";
-  return `• ${name} [${state}]\n  MAC: ${d.mac} | IP: ${ips}\n  Type: ${type}\n  Last changed: ${lastChanged}`;
+  if (process.platform === "win32") {
+    return fingGetViaCurl<T>(url);
+  }
+
+  return fingGetViaFetch<T>(url);
 }
 
-function formatPerson(p: FingPerson, index: number): string {
-  const name = (p.contactInfo as { name?: string })?.name ?? `Person ${index + 1}`;
-  const state = p.currentState === "ONLINE" ? "🟢 ONLINE" : "🔴 OFFLINE";
-  const changed = p.stateChangeTime ? new Date(p.stateChangeTime).toLocaleString() : "n/a";
-  return `• ${name} [${state}]\n  Last state change: ${changed}`;
+function formatTimestamp(value?: string): string {
+  if (!value) {
+    return "n/a";
+  }
+
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
-// ─── MCP Server Factory ───────────────────────────────────────────────────────
+function formatDevice(device: FingDevice): string {
+  const ips = device.ip?.join(", ") ?? "unknown";
+  const name = device.name ?? "Unnamed device";
+  const type = [device.make, device.model, device.type].filter(Boolean).join(" ") || "Unknown";
+  const state = device.state === "UP" ? "UP" : "DOWN";
+
+  return [
+    `- ${name} [${state}]`,
+    `  MAC: ${device.mac} | IP: ${ips}`,
+    `  Type: ${type}`,
+    `  Last changed: ${formatTimestamp(device.last_changed)}`
+  ].join("\n");
+}
+
+function formatPerson(person: FingPerson, index: number): string {
+  const name =
+    person.contactInfo?.displayName ??
+    person.contactInfo?.name ??
+    `Person ${index + 1}`;
+  const state = person.currentState === "ONLINE" ? "ONLINE" : "OFFLINE";
+
+  return [
+    `- ${name} [${state}]`,
+    `  Last state change: ${formatTimestamp(person.stateChangeTime)}`
+  ].join("\n");
+}
 
 function createMcpServer(): McpServer {
   const server = new McpServer({
@@ -106,7 +282,6 @@ function createMcpServer(): McpServer {
     version: "1.0.0"
   });
 
-  // Tool: fing_get_devices
   server.registerTool(
     "fing_get_devices",
     {
@@ -131,12 +306,12 @@ Returns:
   Network ID is included in the response.
 
 Examples:
-  - "Who is connected right now?" → filter_state: 'UP'
-  - "Show me all known devices" → filter_state: 'ALL'
-  - "Is my NAS online?" → filter_state: 'UP', then check by name/IP
+  - "Who is connected right now?" -> filter_state: 'UP'
+  - "Show me all known devices" -> filter_state: 'ALL'
+  - "Is my NAS online?" -> filter_state: 'UP', then check by name/IP
 
 Error handling:
-  - Returns error if Fing API key is invalid (401)
+  - Returns error if Fing API auth is invalid (401)
   - Returns error if Fing Desktop/Agent is not running (503)`,
       inputSchema: z.object({
         filter_state: z.enum(["UP", "DOWN", "ALL"]).default("ALL")
@@ -153,30 +328,37 @@ Error handling:
     },
     async ({ filter_state, response_format }) => {
       let data: FingDevicesResponse;
+
       try {
         data = await fingGet<FingDevicesResponse>("devices");
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
         return { content: [{ type: "text", text: `Error fetching devices: ${message}` }] };
       }
 
-      const devices = filter_state === "ALL"
-        ? data.devices
-        : data.devices.filter(d => d.state === filter_state);
+      const devices =
+        filter_state === "ALL"
+          ? data.devices
+          : data.devices.filter((device) => device.state === filter_state);
 
       if (response_format === "json") {
-        const output = { networkId: data.networkId, count: devices.length, devices };
+        const output = {
+          networkId: data.networkId,
+          count: devices.length,
+          devices
+        };
+
         return {
           content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
           structuredContent: output
         };
       }
 
-      const upCount = devices.filter(d => d.state === "UP").length;
-      const downCount = devices.filter(d => d.state === "DOWN").length;
+      const upCount = devices.filter((device) => device.state === "UP").length;
+      const downCount = devices.filter((device) => device.state === "DOWN").length;
       const lines = [
         `Network: ${data.networkId}`,
-        `Devices shown: ${devices.length} (🟢 ${upCount} UP, 🔴 ${downCount} DOWN)`,
+        `Devices shown: ${devices.length} (${upCount} UP, ${downCount} DOWN)`,
         "",
         ...devices.map(formatDevice)
       ];
@@ -185,7 +367,6 @@ Error handling:
     }
   );
 
-  // Tool: fing_get_people
   server.registerTool(
     "fing_get_people",
     {
@@ -211,7 +392,7 @@ Returns:
 Note: People must be configured in Fing Desktop/App for this to return useful data.
 
 Error handling:
-  - Returns error if Fing API key is invalid (401)
+  - Returns error if Fing API auth is invalid (401)
   - Returns error if Fing Desktop/Agent is not running (503)`,
       inputSchema: z.object({
         filter_state: z.enum(["ONLINE", "OFFLINE", "ALL"]).default("ALL")
@@ -228,16 +409,18 @@ Error handling:
     },
     async ({ filter_state, response_format }) => {
       let data: FingPeopleResponse;
+
       try {
         data = await fingGet<FingPeopleResponse>("people");
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
         return { content: [{ type: "text", text: `Error fetching people: ${message}` }] };
       }
 
-      const people = filter_state === "ALL"
-        ? data.people
-        : data.people.filter(p => p.currentState === filter_state);
+      const people =
+        filter_state === "ALL"
+          ? data.people
+          : data.people.filter((person) => person.currentState === filter_state);
 
       if (response_format === "json") {
         const output = {
@@ -246,6 +429,7 @@ Error handling:
           count: people.length,
           people
         };
+
         return {
           content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
           structuredContent: output
@@ -256,21 +440,21 @@ Error handling:
         return {
           content: [{
             type: "text",
-            text: filter_state === "ALL"
-              ? "No people configured in Fing. Add people in Fing Desktop/App to track presence."
-              : `No people with state ${filter_state} found.`
+            text:
+              filter_state === "ALL"
+                ? "No people configured in Fing. Add people in Fing Desktop/App to track presence."
+                : `No people with state ${filter_state} found.`
           }]
         };
       }
 
-      const onlineCount = people.filter(p => p.currentState === "ONLINE").length;
-      const lastChange = data.lastChangeTime ? new Date(data.lastChangeTime).toLocaleString() : "n/a";
+      const onlineCount = people.filter((person) => person.currentState === "ONLINE").length;
       const lines = [
         `Network: ${data.networkId}`,
-        `People shown: ${people.length} (🟢 ${onlineCount} ONLINE, 🔴 ${people.length - onlineCount} OFFLINE)`,
-        `Last network change: ${lastChange}`,
+        `People shown: ${people.length} (${onlineCount} ONLINE, ${people.length - onlineCount} OFFLINE)`,
+        `Last network change: ${formatTimestamp(data.lastChangeTime)}`,
         "",
-        ...people.map((p, i) => formatPerson(p, i))
+        ...people.map(formatPerson)
       ];
 
       return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -280,54 +464,59 @@ Error handling:
   return server;
 }
 
-// ─── HTTP Server ──────────────────────────────────────────────────────────────
-
 const app = express();
 app.use(express.json());
 
-// SSE transport sessions (for mcp-remote compatibility)
 const sseTransports = new Map<string, SSEServerTransport>();
 
-// SSE: GET /mcp — opens the SSE stream (used by mcp-remote)
-app.get("/mcp", async (req: Request, res: Response) => {
+app.get("/mcp", async (_req: Request, res: Response) => {
   const transport = new SSEServerTransport("/mcp/message", res);
   sseTransports.set(transport.sessionId, transport);
   res.on("close", () => sseTransports.delete(transport.sessionId));
+
   const server = createMcpServer();
   await server.connect(transport);
 });
 
-// SSE: POST /mcp/message — receives messages from mcp-remote
 app.post("/mcp/message", async (req: Request, res: Response) => {
   const sessionId = req.query.sessionId as string;
   const transport = sseTransports.get(sessionId);
+
   if (!transport) {
     res.status(404).json({ error: "Session not found" });
     return;
   }
+
   await transport.handlePostMessage(req, res, req.body);
 });
 
-// Streamable HTTP: POST /mcp — native Claude Desktop "type: http" support
 app.post("/mcp", async (req: Request, res: Response) => {
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true
   });
+
   res.on("close", () => transport.close());
+
   const server = createMcpServer();
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
 });
 
-// Health check
 app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", service: "fing-mcp-server", version: "1.0.0" });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
   console.error(`Fing MCP server running on http://0.0.0.0:${PORT}`);
-  console.error(`  SSE (mcp-remote):        GET  http://0.0.0.0:${PORT}/mcp`);
+  console.error(`Using Fing local API at ${FING_BASE_URL}`);
+  console.error(`Local API config path: ${FING_CONFIG.localApiConfigPath}`);
+
+  if (FING_CONFIG.localApiEnabled === false) {
+    console.error("WARNING: Fing local API is disabled in the local FingAgent config file.");
+  }
+
+  console.error(`  SSE (mcp-remote):         GET  http://0.0.0.0:${PORT}/mcp`);
   console.error(`  Streamable HTTP (native): POST http://0.0.0.0:${PORT}/mcp`);
   console.error(`  Health check:             GET  http://0.0.0.0:${PORT}/health`);
 });
