@@ -8,7 +8,7 @@ local API on `http://localhost:49090` and stores its auth token in:
 
 `%APPDATA%\FingAgent\conf\localapi\fingagent.json`
 
-## How It Works on PC-FEDERICO
+## How It Works on my machine
 
 At startup the server:
 
