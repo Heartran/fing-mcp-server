@@ -1,0 +1,58 @@
+{
+  "manifest_version": "0.2",
+  "name": "fing-mcp-server",
+  "display_name": "Fing MCP Server",
+  "version": "1.0.0",
+  "description": "MCP server for Fing Local API - network device and presence monitoring",
+  "icon": "icon.png",
+  "author": {
+    "name": "Heartran",
+    "email": "heartran@papin-network.it",
+    "url": "https://github.com/Heartran"
+  },
+  "homepage": "https://github.com/Heartran/fing-mcp-server",
+  "documentation": "https://github.com/Heartran/fing-mcp-server/wiki",
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/dist/index.js"
+      ],
+      "env": {
+        "FING_API_KEY": "${user_config.FING_API_KEY}",
+        "FING_BASE_URL": "${user_config.FING_BASE_URL}",
+        "PORT": "${user_config.PORT}"
+      }
+    }
+  },
+  "user_config": {
+    "FING_API_KEY": {
+      "type": "string",
+      "title": "Fing API key",
+      "description": "API key for the Fing Local API",
+      "required": true,
+      "sensitive": true
+    },
+    "FING_BASE_URL": {
+      "type": "string",
+      "title": "Fing Base URL",
+      "description": "Base URL for the Fing Local API",
+      "required": false,
+      "default": "http://localhost:49090/1"
+    },
+    "PORT": {
+      "type": "number",
+      "title": "Port",
+      "description": "Port on which this MCP server listens",
+      "required": false,
+      "default": 3010
+    }
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Heartran/fing-mcp-server"
+  }
+}
